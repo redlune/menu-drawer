@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleIdentifier</key>
+    <string>local.yubi.MenuDrawer</string>
+    <key>CFBundleName</key>
+    <string>Menu Drawer</string>
+    <key>CFBundleDisplayName</key>
+    <string>Menu Drawer</string>
+    <key>CFBundleExecutable</key>
+    <string>MenuDrawer</string>
+    <key>CFBundleIconFile</key>
+    <string>MenuDrawer.icns</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleVersion</key>
+    <string>10</string>
+    <key>CFBundleShortVersionString</key>
+    <string>1.2.5</string>
+    <key>CFBundleDevelopmentRegion</key>
+    <string>en</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>27.0</string>
+    <key>LSUIElement</key>
+    <true/>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+    <key>UTExportedTypeDeclarations</key>
+    <array>
+        <dict>
+            <key>UTTypeIdentifier</key>
+            <string>local.yubi.menudrawer.app</string>
+            <key>UTTypeDescription</key>
+            <string>Menu Drawer app identifier</string>
+            <key>UTTypeConformsTo</key>
+            <array>
+                <string>public.data</string>
+            </array>
+        </dict>
+    </array>
+</dict>
+</plist>
