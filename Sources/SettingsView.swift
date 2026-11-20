@@ -4,6 +4,10 @@ import UniformTypeIdentifiers
 struct SettingsView: View {
     @ObservedObject var controller: DrawerController
     @Environment(\.colorScheme) private var colorScheme
+    @State private var search = ""
+    @State private var showAllRunning = false
+    @State private var hoveringDrawer = false
+    @State private var hoveringMenuBar = false
 
     private static let dragType = UTType(exportedAs: "local.yubi.menudrawer.app", conformingTo: .data)
     private var accent: Color {
@@ -23,7 +27,7 @@ struct SettingsView: View {
 
             HStack(alignment: .top, spacing: 14) {
                 column(
-                    title: controller.showAllRunning || !controller.hasAccessibility ? "layout.runningApps" : "layout.menuBar",
+                    title: showAllRunning || !controller.hasAccessibility ? "layout.runningApps" : "layout.menuBar",
                     icon: "menubar.rectangle",
                     apps: visibleApps,
                     isHidden: false
@@ -53,10 +57,11 @@ struct SettingsView: View {
             Spacer()
             Menu {
                 if controller.hasAccessibility {
-                    Toggle("layout.showAllRunning", isOn: $controller.showAllRunning)
+                    Toggle("layout.showAllRunning", isOn: $showAllRunning)
                 }
-                Button("layout.refresh") { controller.refreshMenuBarApps() }
+                Button("layout.refresh") { controller.refreshMenuBarApps(retryFailedPlacements: true) }
                 Divider()
+                CheckForUpdatesButton(updater: controller.updater)
                 Button("app.quit") { NSApp.terminate(nil) }
             } label: {
                 Image(systemName: "ellipsis.circle")
@@ -80,14 +85,14 @@ struct SettingsView: View {
     }
 
     private func column(title: LocalizedStringKey, icon: String, apps: [SavedApp], isHidden: Bool) -> some View {
-        let target = isHidden ? $controller.hoveringDrawer : $controller.hoveringMenuBar
+        let target = isHidden ? $hoveringDrawer : $hoveringMenuBar
         return VStack(alignment: .leading, spacing: 10) {
             Label(title, systemImage: icon)
                 .font(.headline)
                 .accessibilityAddTraits(.isHeader)
 
             if !isHidden {
-                TextField("layout.search", text: $controller.search)
+                TextField("layout.search", text: $search)
                     .textFieldStyle(.roundedBorder)
             }
 
@@ -139,7 +144,7 @@ struct SettingsView: View {
             }
             .padding(.vertical, 8)
         } else {
-            Text(controller.search.isEmpty ? String(localized: "layout.noApps") : String(localized: "layout.noSearchResults"))
+            Text(search.isEmpty ? String(localized: "layout.noApps") : String(localized: "layout.noSearchResults"))
                 .foregroundStyle(.secondary)
                 .padding(.vertical, 8)
         }
@@ -204,12 +209,12 @@ struct SettingsView: View {
 
     private var visibleApps: [SavedApp] {
         let hidden = Set(controller.hiddenApps.map(\.id))
-        let search = controller.search.trimmingCharacters(in: .whitespacesAndNewlines)
+        let query = search.trimmingCharacters(in: .whitespacesAndNewlines)
         var seen: Set<String> = []
         return controller.runningApps.map(\.app).filter { app in
             !hidden.contains(app.id)
-                && (controller.showAllRunning || !controller.hasAccessibility || controller.menuBarAppIDs.contains(app.id))
-                && (search.isEmpty || app.name.localizedCaseInsensitiveContains(search))
+                && (showAllRunning || !controller.hasAccessibility || controller.menuBarAppIDs.contains(app.id))
+                && (query.isEmpty || app.name.localizedCaseInsensitiveContains(query))
                 && seen.insert(app.id).inserted
         }
         .sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }

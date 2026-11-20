@@ -10,7 +10,7 @@ struct DrawerView: View {
                     ForEach(controller.drawerApps) { app in
                         DrawerAppButton(
                             app: app,
-                            isPreparing: !controller.preparingAppIDs.isEmpty,
+                            isPreparing: controller.isPreparingApps,
                             open: { controller.openHiddenApp(app) },
                             keepVisible: { controller.setHidden(app, to: false) }
                         )
@@ -40,6 +40,7 @@ struct DrawerView: View {
                     controller.toggle()
                     controller.dismissDrawer()
                 }
+                CheckForUpdatesButton(updater: controller.updater, beforeCheck: controller.dismissDrawer)
                 Button("app.quit") { NSApp.terminate(nil) }
             } label: {
                 Image(systemName: controller.menuOpenError == nil ? "ellipsis" : "exclamationmark.circle")

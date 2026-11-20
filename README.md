@@ -35,6 +35,16 @@ bash ./build.sh
 
 `.build/MenuDrawer.app`에 로컬 서명된 Apple Silicon 앱을 생성합니다. 별도 인증서로 빌드할 때는 `SIGN_IDENTITY`를 지정합니다.
 
+## 업데이트
+
+업데이트 기능이 있는 버전에서는 서랍의 **… → 업데이트 확인…**을 누릅니다. 새 버전이 있으면 Sparkle 창에서 **설치**를 누르면 되고, 설치한 앱이 다시 열립니다. 이전 버전은 새 DMG로 한 번 교체해야 합니다. 로컬 서명 빌드를 교체한 뒤에는 손쉬운 사용을 다시 허용해야 할 수 있습니다.
+
+### GitHub Actions로 배포
+
+저장소의 **Settings → Secrets and variables → Actions**에 `Resources/Info.plist`의 `SUPublicEDKey`와 짝이 되는 개인 키를 `SPARKLE_PRIVATE_KEY`라는 Secret으로 등록합니다. 새 배포 채널을 처음 설정할 때는 `xcrun swift scripts/sparkle-key.swift generate /path/to/new-private-key`로 키 쌍을 만들 수 있습니다. 개인 키는 공개 저장소 밖에 보관하고 암호화된 백업을 유지하세요.
+
+배포할 때는 `CFBundleShortVersionString`과 `CFBundleVersion`을 올려 `main`에 반영한 뒤, **Actions → Release Menu Drawer → Run workflow**를 실행합니다. 워크플로가 빌드와 서명을 수행하고 DMG와 `appcast.xml`을 함께 게시합니다. 앱은 [GitHub의 최신 릴리스](https://github.com/redlune/menu-drawer/releases/latest)에서 업데이트 목록을 읽습니다.
+
 ## macOS 호환성
 
 아이콘 숨기기는 macOS 27의 비공개 메뉴 막대 프레임워크를 사용합니다. macOS 업데이트가 이 동작을 바꿀 수 있습니다. 서랍이 접혀 있는 동안 집중 모드·지금 재생 중 등 일부 시스템 항목과 시계 클릭을 통한 알림 센터 열기가 제한될 수 있습니다. 서랍을 펼치거나 앱을 종료하면 표시 제한을 해제합니다. [macOS 27에서 확인된 시스템 동작](https://github.com/dwarvesf/hidden/pull/438)

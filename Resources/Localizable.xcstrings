@@ -18,6 +18,23 @@
         }
       }
     },
+    "updates.check": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Check for Updates…"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "업데이트 확인…"
+          }
+        }
+      }
+    },
     "app.quit": {
       "extractionState": "manual",
       "localizations": {
@@ -266,13 +283,13 @@
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "Couldn’t arrange %@. Move it out of the drawer and add it again."
+            "value": "Couldn’t arrange %@. Check the menu bar or refresh the layout to try again."
           }
         },
         "ko": {
           "stringUnit": {
             "state": "translated",
-            "value": "%@ 배치를 완료하지 못했어요. 서랍에서 꺼냈다가 다시 넣어 주세요."
+            "value": "%@ 배치를 완료하지 못했어요. 메뉴 막대를 확인하거나 아이콘 배치에서 새로 고쳐 주세요."
           }
         }
       },

@@ -42,8 +42,12 @@ struct RunningApp {
 }
 
 enum MenuBarInventory {
-    struct Item: Sendable {
-        let app: SavedApp
+    // Share only an immutable identity. Accessibility queries stay inside the inventory.
+    struct WindowID: Hashable, @unchecked Sendable {
+        fileprivate let element: AXUIElement
+
+        static func == (lhs: Self, rhs: Self) -> Bool { CFEqual(lhs.element, rhs.element) }
+        func hash(into hasher: inout Hasher) { hasher.combine(CFHash(element)) }
     }
 
     static func scan(_ candidates: [RunningApp]) async -> Set<String> {
@@ -64,21 +68,21 @@ enum MenuBarInventory {
         }
     }
 
-    static func items(at point: CGPoint, candidates: [RunningApp]) async -> [Item] {
-        await withTaskGroup(of: Item?.self) { group in
+    static func apps(at point: CGPoint, candidates: [RunningApp]) async -> [SavedApp] {
+        await withTaskGroup(of: SavedApp?.self) { group in
             var pending = candidates.makeIterator()
             func enqueue(_ candidate: RunningApp) {
                 group.addTask {
                     guard !Task.isCancelled,
                           items(for: candidate.pid).contains(where: { itemFrame(of: $0)?.contains(point) == true })
                     else { return nil }
-                    return Item(app: candidate.app)
+                    return candidate.app
                 }
             }
             for _ in 0..<8 {
                 if let candidate = pending.next() { enqueue(candidate) }
             }
-            var matches: [Item] = []
+            var matches: [SavedApp] = []
             while let result = await group.next() {
                 if let result { matches.append(result) }
                 if !Task.isCancelled, let candidate = pending.next() { enqueue(candidate) }
@@ -99,6 +103,7 @@ enum MenuBarInventory {
                 guard targets.contains(where: { isInMenuBar(frame(of: $0), menuBarFrames) }) else { continue }
                 for target in targets {
                     for action in [kAXPressAction, kAXShowMenuAction] {
+                        guard !Task.isCancelled else { return false }
                         let result = AXUIElementPerformAction(target, action as CFString)
                         if result == .success || result == .cannotComplete { return true }
                     }
@@ -113,11 +118,6 @@ enum MenuBarInventory {
         }
     }
 
-    static func renderedItemCenter(pid: pid_t, menuBarFrames: [CGRect]) async -> CGPoint? {
-        guard let frame = await renderedItemFrame(pid: pid, menuBarFrames: menuBarFrames) else { return nil }
-        return CGPoint(x: frame.midX, y: frame.midY)
-    }
-
     static func renderedItemFrame(pid: pid_t, menuBarFrames: [CGRect]) async -> CGRect? {
         await Task.detached(priority: .userInitiated) {
             let appItems = items(for: pid).compactMap { item -> (CGRect, Set<String>)? in
@@ -125,14 +125,11 @@ enum MenuBarInventory {
                       let frame = frame(of: target) else { return nil }
                 return (frame, labels(of: target))
             }
-            guard !appItems.isEmpty,
-                  let agent = NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.MenuBarAgent").first
-            else { return nil }
-            let root = accessibilityApp(pid: agent.processIdentifier)
-            let windows = value(of: root, kAXWindowsAttribute) as? [AXUIElement] ?? []
+            guard !appItems.isEmpty else { return nil }
+            let slots = renderedSlots()
 
             for (appFrame, appLabels) in appItems {
-                let candidates = windows.flatMap(children(of:)).filter { slot in
+                let candidates = slots.filter { slot in
                     guard let slotFrame = frame(of: slot) else { return false }
                     return abs(slotFrame.midX - appFrame.midX) < 2 && abs(slotFrame.midY - appFrame.midY) < 3
                 }
@@ -170,12 +167,9 @@ enum MenuBarInventory {
 
     static func leadingItemFrame(in menuBarFrames: [CGRect], containing item: CGRect) async -> CGRect? {
         await Task.detached(priority: .userInitiated) {
-            guard let bar = menuBarFrames.first(where: { $0.contains(CGPoint(x: item.midX, y: item.midY)) }),
-                  let agent = NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.MenuBarAgent").first
+            guard let bar = menuBarFrames.first(where: { $0.contains(CGPoint(x: item.midX, y: item.midY)) })
             else { return nil }
-            let root = accessibilityApp(pid: agent.processIdentifier)
-            let windows = value(of: root, kAXWindowsAttribute) as? [AXUIElement] ?? []
-            let frames = windows.flatMap(children(of:)).compactMap { slot -> CGRect? in
+            let frames = renderedSlots().compactMap { slot -> CGRect? in
                 guard let rect = frame(of: slot), rect.height > 0, rect.height <= bar.height,
                       bar.contains(CGPoint(x: rect.midX, y: rect.midY)),
                       abs(rect.midY - item.midY) < 3,
@@ -187,19 +181,55 @@ enum MenuBarInventory {
         }.value
     }
 
-    static func popupFrames(pid: pid_t) async -> Set<CGRect> {
+    static func windowIDs(pid: pid_t) async -> Set<WindowID> {
         await Task.detached {
-            let app = accessibilityApp(pid: pid)
-            var windows = value(of: app, kAXWindowsAttribute) as? [AXUIElement] ?? []
-            if let focused = value(of: app, kAXFocusedWindowAttribute), CFGetTypeID(focused) == AXUIElementGetTypeID() {
-                windows.append(focused as! AXUIElement)
-            }
-            return Set(windows.compactMap { window in
-                guard value(of: window, kAXMinimizedAttribute) as? Bool != true,
-                      let frame = frame(of: window), frame.width >= 35, frame.height >= 32 else { return nil }
-                return frame
-            })
+            Set(windows(for: pid).map { WindowID(element: $0) })
         }.value
+    }
+
+    static func newPopup(pid: pid_t, near anchor: CGRect, excluding existing: Set<WindowID>) async -> WindowID? {
+        await Task.detached {
+            for window in windows(for: pid) {
+                let id = WindowID(element: window)
+                guard !existing.contains(id), let bounds = popupFrame(of: window),
+                      bounds.minY >= anchor.midY, bounds.minY <= anchor.maxY + 48,
+                      (bounds.minX - 12...bounds.maxX + 12).contains(anchor.midX) else { continue }
+                return id
+            }
+            return nil
+        }.value
+    }
+
+    static func popupIsOpen(pid: pid_t, id: WindowID) async -> Bool {
+        await Task.detached {
+            windows(for: pid).contains { WindowID(element: $0) == id && popupFrame(of: $0) != nil }
+        }.value
+    }
+
+    private static func windows(for pid: pid_t) -> [AXUIElement] {
+        let app = accessibilityApp(pid: pid)
+        var windows = value(of: app, kAXWindowsAttribute) as? [AXUIElement] ?? []
+        if let focused = value(of: app, kAXFocusedWindowAttribute), CFGetTypeID(focused) == AXUIElementGetTypeID() {
+            windows.append(focused as! AXUIElement)
+        }
+        return windows
+    }
+
+    private static func popupFrame(of window: AXUIElement) -> CGRect? {
+        guard value(of: window, kAXMinimizedAttribute) as? Bool != true,
+              let role = value(of: window, kAXRoleAttribute) as? String else { return nil }
+        if role != kAXPopoverRole && role != kAXMenuRole {
+            // AppKit can expose a borderless, nonactivating panel as a system dialog.
+            let panelSubroles = [kAXUnknownSubrole, kAXFloatingWindowSubrole, kAXSystemFloatingWindowSubrole,
+                                 kAXDialogSubrole, kAXSystemDialogSubrole]
+            let subrole = value(of: window, kAXSubroleAttribute) as? String
+            guard role == kAXWindowRole,
+                  subrole.map(panelSubroles.contains) ?? true,
+                  value(of: window, kAXCloseButtonAttribute) == nil,
+                  value(of: window, kAXTitleUIElementAttribute) == nil else { return nil }
+        }
+        guard let bounds = frame(of: window), bounds.width >= 35, bounds.height >= 32 else { return nil }
+        return bounds
     }
 
     private static func accessibilityApp(pid: pid_t) -> AXUIElement {
@@ -213,6 +243,14 @@ enum MenuBarInventory {
         guard let extras = value(of: app, "AXExtrasMenuBar"),
               CFGetTypeID(extras) == AXUIElementGetTypeID() else { return [] }
         return children(of: extras as! AXUIElement)
+    }
+
+    private static func renderedSlots() -> [AXUIElement] {
+        guard let agent = NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.MenuBarAgent").first
+        else { return [] }
+        let root = accessibilityApp(pid: agent.processIdentifier)
+        let windows = value(of: root, kAXWindowsAttribute) as? [AXUIElement] ?? []
+        return windows.flatMap(children(of:))
     }
 
     private static func children(of element: AXUIElement) -> [AXUIElement] {

@@ -5,7 +5,7 @@ final class MenuBarDragMonitor {
     private struct Drag {
         let id = UUID()
         let start: CGPoint
-        let source: Task<[MenuBarInventory.Item], Never>
+        let source: Task<[SavedApp], Never>
     }
 
     private var observation: Any?
@@ -34,7 +34,7 @@ final class MenuBarDragMonitor {
                           !button.contains(point) else { return }
                     let apps = candidates()
                     let source = Task {
-                        await MenuBarInventory.items(at: point, candidates: apps)
+                        await MenuBarInventory.apps(at: point, candidates: apps)
                     }
                     let drag = Drag(start: point, source: source)
                     self.generation = drag.id
@@ -52,8 +52,8 @@ final class MenuBarDragMonitor {
                         guard self?.generation == drag.id,
                               ProcessInfo.processInfo.systemUptime - droppedAt < 2,
                               let first = matches.first,
-                              matches.allSatisfy({ $0.app.id == first.app.id }) else { return }
-                        didDrop(first.app)
+                              matches.allSatisfy({ $0.id == first.id }) else { return }
+                        didDrop(first)
                     }
                 default:
                     break

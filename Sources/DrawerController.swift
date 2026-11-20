@@ -4,20 +4,21 @@ import SwiftUI
 
 @MainActor
 final class DrawerController: NSObject, NSApplicationDelegate, @preconcurrency NSStatusItemExpandedInterfaceDelegate, ObservableObject {
+    private struct PlacementRequest: Equatable {
+        let id = UUID()
+        let appID: String
+        let pid: pid_t
+    }
+
     @Published private(set) var hiddenApps: [SavedApp] = []
     @Published private(set) var runningApps: [RunningApp] = []
     @Published private(set) var menuBarAppIDs: Set<String> = []
     @Published private(set) var hasAccessibility = false
     @Published private(set) var isScanning = false
     @Published private(set) var isCollapsed = false
-    @Published private(set) var isApplying = false
     @Published private(set) var errorMessage: String?
     @Published private(set) var menuOpenError: String?
-    @Published private(set) var preparingAppIDs: Set<String> = []
-    @Published var search = ""
-    @Published var showAllRunning = false
-    @Published var hoveringDrawer = false
-    @Published var hoveringMenuBar = false
+    @Published private var preparingApps: [String: PlacementRequest] = [:]
     @Published var autoCollapseDelay = 0 {
         didSet {
             defaults.set(autoCollapseDelay, forKey: "AutoCollapseDelay")
@@ -26,18 +27,16 @@ final class DrawerController: NSObject, NSApplicationDelegate, @preconcurrency N
     }
 
     private let defaults = UserDefaults.standard
+    let updater = AppUpdater()
     private let bundleID = Bundle.main.bundleIdentifier ?? "local.yubi.MenuDrawer"
     private var statusItem: NSStatusItem?
     private var settingsWindow: NSWindow?
     private var drawerPanel: DrawerPanel?
-    private var drawerLocalClickMonitor: Any?
-    private var drawerGlobalClickMonitor: Any?
-    private var drawerPresentedAt: TimeInterval = 0
     private let dragMonitor = MenuBarDragMonitor()
     private var accessTimer: Timer?
     private var interactionTask: Task<Void, Never>?
     private var openingAppID: String?
-    private var placementQueue: [SavedApp] = []
+    private var placementQueue: [PlacementRequest] = []
     private var placementTask: Task<Void, Never>?
     private var placementGeneration = UUID()
     private var placements: [String: (pid: pid_t, ready: Bool)] = [:]
@@ -46,12 +45,7 @@ final class DrawerController: NSObject, NSApplicationDelegate, @preconcurrency N
     private var scanTask: Task<Void, Never>?
     private var autoCollapseTimer: Timer?
     private var wantsCollapsed = false
-    private var activeToken: NSObject?
-    private var activeBundles: Set<String>?
-    private var pendingToken: NSObject?
-    private var pendingBundles: Set<String>?
-    private var pendingRequest: UUID?
-    private var requestTimeout: DispatchWorkItem?
+    private let visibility = MenuBarVisibility()
 
     var installationRequired: Bool {
         let path = Bundle.main.bundleURL.resolvingSymlinksInPath().path
@@ -63,9 +57,11 @@ final class DrawerController: NSObject, NSApplicationDelegate, @preconcurrency N
     }
 
     var drawerApps: [SavedApp] {
-        let running = Set(runningApps.map { $0.app.id })
-        return hiddenApps.filter { running.contains($0.id) }
+        let running = Dictionary(runningApps.map { ($0.app.id, $0.app) }, uniquingKeysWith: { first, _ in first })
+        return hiddenApps.compactMap { running[$0.id] }
     }
+
+    var isPreparingApps: Bool { !preparingApps.isEmpty }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         if let data = defaults.data(forKey: "HiddenApps"),
@@ -101,6 +97,7 @@ final class DrawerController: NSObject, NSApplicationDelegate, @preconcurrency N
             showSettings()
         }
         if !hiddenApps.isEmpty && canHide { collapse() }
+        updater.start()
     }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
@@ -130,51 +127,12 @@ final class DrawerController: NSObject, NSApplicationDelegate, @preconcurrency N
     }
 
     func statusItemDidEndExpandedInterfaceSession(_ statusItem: NSStatusItem, animated: Bool) {
-        hideDrawerPanel()
+        drawerPanel?.hide()
     }
 
     func dismissDrawer() {
-        hideDrawerPanel()
+        drawerPanel?.hide()
         statusItem?.expandedInterfaceSession?.cancel()
-    }
-
-    private func hideDrawerPanel() {
-        if let drawerLocalClickMonitor {
-            NSEvent.removeMonitor(drawerLocalClickMonitor)
-            self.drawerLocalClickMonitor = nil
-        }
-        if let drawerGlobalClickMonitor {
-            NSEvent.removeMonitor(drawerGlobalClickMonitor)
-            self.drawerGlobalClickMonitor = nil
-        }
-        drawerPanel?.dismissesOnResignKey = false
-        drawerPanel?.orderOut(nil)
-    }
-
-    private func monitorDrawerClicks() {
-        guard drawerLocalClickMonitor == nil, drawerGlobalClickMonitor == nil else { return }
-        let mouseDown: NSEvent.EventTypeMask = [.leftMouseDown, .rightMouseDown, .otherMouseDown]
-        drawerLocalClickMonitor = NSEvent.addLocalMonitorForEvents(matching: mouseDown) { [weak self] event in
-            MainActor.assumeIsolated { self?.dismissDrawerIfOutside(event) }
-            return event
-        }
-        drawerGlobalClickMonitor = NSEvent.addGlobalMonitorForEvents(matching: mouseDown) { [weak self] event in
-            MainActor.assumeIsolated { self?.dismissDrawerIfOutside(event) }
-        }
-    }
-
-    private func dismissDrawerIfOutside(_ event: NSEvent) {
-        guard let panel = drawerPanel, panel.isVisible, event.window !== panel,
-              event.timestamp >= drawerPresentedAt else { return }
-        let point: CGPoint
-        if let mouseEvent = event.cgEvent, let primary = NSScreen.screens.first {
-            // Quartz events use a global top-left origin. Window frames use AppKit coordinates.
-            guard mouseEvent.getIntegerValueField(.eventSourceUserData) != MenuBarClick.eventMarker else { return }
-            point = CGPoint(x: mouseEvent.location.x, y: primary.frame.maxY - mouseEvent.location.y)
-        } else {
-            point = event.window?.convertPoint(toScreen: event.locationInWindow) ?? event.locationInWindow
-        }
-        if !panel.frame.contains(point) { dismissDrawer() }
     }
 
     func toggle() {
@@ -189,14 +147,13 @@ final class DrawerController: NSObject, NSApplicationDelegate, @preconcurrency N
         guard app.id != bundleID, !app.id.hasPrefix("com.apple.") else { return }
         if shouldHide {
             if !hiddenApps.contains(where: { $0.id == app.id }) { hiddenApps.append(app) }
-            placements.removeValue(forKey: app.id)
         } else {
             hiddenApps.removeAll { $0.id == app.id }
             menuBarAppIDs.insert(app.id)
-            placementQueue.removeAll { $0.id == app.id }
-            preparingAppIDs.remove(app.id)
-            placements.removeValue(forKey: app.id)
+            placementQueue.removeAll { $0.appID == app.id }
+            preparingApps.removeValue(forKey: app.id)
         }
+        placements.removeValue(forKey: app.id)
         prepareHiddenApps()
         if let data = try? JSONEncoder().encode(hiddenApps) {
             defaults.set(data, forKey: "HiddenApps")
@@ -219,7 +176,8 @@ final class DrawerController: NSObject, NSApplicationDelegate, @preconcurrency N
         if let app { setHidden(app, to: toDrawer) }
     }
 
-    func refreshMenuBarApps() {
+    func refreshMenuBarApps(retryFailedPlacements: Bool = false) {
+        if retryFailedPlacements { placements = placements.filter { $0.value.ready } }
         refreshRunningApps()
         lastLayoutScanPIDs = Set(runningApps.map(\.pid))
         scanTask?.cancel()
@@ -281,67 +239,26 @@ final class DrawerController: NSObject, NSApplicationDelegate, @preconcurrency N
     private func syncVisibility() {
         guard wantsCollapsed else { return }
         let running = Set(NSWorkspace.shared.runningApplications.compactMap(\.bundleIdentifier))
-        var hidden = Set(hiddenApps.map(\.id))
-        hidden.subtract(preparingAppIDs)
-        if let openingAppID { hidden.remove(openingAppID) }
+        let hidden = Set(hiddenApps.lazy.map(\.id).filter { id in
+            self.placements[id]?.ready == true && id != self.openingAppID
+        })
         guard !running.isDisjoint(with: hidden) else {
-            clearRestriction()
+            visibility.restore()
             isCollapsed = true
             updateStatusItem()
             return
         }
 
-        applyVisibility(allowing: running.subtracting(hidden).union([bundleID]))
-    }
-
-    private func applyVisibility(allowing allowed: Set<String>) {
-        guard allowed != pendingBundles else { return }
-        cancelPendingRequest()
-        guard allowed != activeBundles else {
-            updateStatusItem()
-            return
+        let allowed = running.subtracting(hidden).union([bundleID])
+        visibility.restrict(to: allowed) { [weak self] applied in
+            guard let self else { return }
+            if applied {
+                isCollapsed = true
+                updateStatusItem()
+            } else {
+                failToHide()
+            }
         }
-
-        let request = UUID()
-        pendingRequest = request
-        pendingBundles = allowed
-        isApplying = true
-        pendingToken = VisibilityBridge.restrict(toBundles: allowed.sorted()) { [weak self] error in
-            self?.finishRequest(request, error: error)
-        }
-        guard pendingToken != nil else {
-            failToHide()
-            return
-        }
-        let timeout = DispatchWorkItem { [weak self] in
-            guard self?.pendingRequest == request else { return }
-            self?.failToHide()
-        }
-        requestTimeout = timeout
-        DispatchQueue.main.asyncAfter(deadline: .now() + 4, execute: timeout)
-        updateStatusItem()
-    }
-
-    private func finishRequest(_ request: UUID, error: Error?) {
-        guard pendingRequest == request else { return }
-        if let error {
-            NSLog("Menu bar visibility request failed: %@", error.localizedDescription)
-            failToHide()
-            return
-        }
-        guard let token = pendingToken else {
-            failToHide()
-            return
-        }
-        if let activeToken {
-            VisibilityBridge.restore(activeToken)
-        }
-        activeToken = token
-        activeBundles = pendingBundles
-        pendingToken = nil
-        cancelPendingRequest()
-        isCollapsed = true
-        updateStatusItem()
     }
 
     private func failToHide() {
@@ -355,30 +272,9 @@ final class DrawerController: NSObject, NSApplicationDelegate, @preconcurrency N
         wantsCollapsed = false
         autoCollapseTimer?.invalidate()
         autoCollapseTimer = nil
-        clearRestriction()
-        updateStatusItem()
-    }
-
-    private func clearRestriction() {
-        cancelPendingRequest()
-        if let activeToken {
-            VisibilityBridge.restore(activeToken)
-        }
-        activeToken = nil
-        activeBundles = nil
+        visibility.restore()
         isCollapsed = false
-    }
-
-    private func cancelPendingRequest() {
-        requestTimeout?.cancel()
-        requestTimeout = nil
-        pendingRequest = nil
-        pendingBundles = nil
-        if let pendingToken {
-            VisibilityBridge.restore(pendingToken)
-        }
-        pendingToken = nil
-        isApplying = false
+        updateStatusItem()
     }
 
     private func scheduleAutoCollapse() {
@@ -419,12 +315,13 @@ final class DrawerController: NSObject, NSApplicationDelegate, @preconcurrency N
         guard trusted != hasAccessibility else { return }
         hasAccessibility = trusted
         if trusted {
+            placements = placements.filter { $0.value.ready }
             prepareHiddenApps()
             dragMonitor.start(
                 candidates: { [weak self] in
                     guard let self else { return [] }
-                    let hidden = self.isCollapsed ? Set(self.hiddenApps.map(\.id)) : []
-                    return self.runningApps.filter { !hidden.contains($0.app.id) }
+                    guard self.isCollapsed else { return self.runningApps }
+                    return self.runningApps.filter { self.placements[$0.app.id]?.ready != true }
                 },
                 anchor: { [weak self] in self?.menuBarAnchor() },
                 didDrop: { [weak self] app in self?.setHidden(app, to: true) }
@@ -453,8 +350,10 @@ final class DrawerController: NSObject, NSApplicationDelegate, @preconcurrency N
         for app in hiddenApps {
             guard let running = runningApps.first(where: { $0.app.id == app.id }),
                   placements[app.id]?.pid != running.pid,
-                  preparingAppIDs.insert(app.id).inserted else { continue }
-            placementQueue.append(app)
+                  preparingApps[app.id] == nil else { continue }
+            let request = PlacementRequest(appID: app.id, pid: running.pid)
+            preparingApps[app.id] = request
+            placementQueue.append(request)
         }
         guard placementTask == nil, !placementQueue.isEmpty else { return }
         let generation = UUID()
@@ -462,30 +361,7 @@ final class DrawerController: NSObject, NSApplicationDelegate, @preconcurrency N
         placementTask = Task { @MainActor [weak self] in
             guard let self else { return }
             while !Task.isCancelled, !placementQueue.isEmpty {
-                let app = placementQueue.removeFirst()
-                // Finish intake before a menu can open. Never drag while another menu is in use.
-                while !Task.isCancelled, openingAppID != nil
-                    || CGEventSource.buttonState(.combinedSessionState, button: .left) {
-                    try? await Task.sleep(for: .milliseconds(50))
-                }
-                guard !Task.isCancelled else { break }
-                guard hiddenApps.contains(where: { $0.id == app.id }),
-                      let running = runningApps.first(where: { $0.app.id == app.id }) else {
-                    preparingAppIDs.remove(app.id)
-                    syncVisibility()
-                    continue
-                }
-                syncVisibility()
-                await waitForMenuBarLayout()
-                guard !Task.isCancelled else { break }
-                let ready = await placeAtLeadingEdge(pid: running.pid, menuBarFrames: menuBarFrames)
-                guard !Task.isCancelled else { break }
-                if hiddenApps.contains(where: { $0.id == app.id }),
-                   runningApps.contains(where: { $0.app.id == app.id && $0.pid == running.pid }) {
-                    placements[app.id] = (running.pid, ready)
-                }
-                preparingAppIDs.remove(app.id)
-                syncVisibility()
+                await place(placementQueue.removeFirst())
             }
             guard placementGeneration == generation else { return }
             placementTask = nil
@@ -493,12 +369,39 @@ final class DrawerController: NSObject, NSApplicationDelegate, @preconcurrency N
         }
     }
 
+    private func place(_ request: PlacementRequest) async {
+        defer {
+            if preparingApps[request.appID] == request {
+                preparingApps.removeValue(forKey: request.appID)
+                syncVisibility()
+            }
+        }
+        // Leave user drags and in-use menus alone while waiting to arrange the icon.
+        while isCurrentPlacement(request), openingAppID != nil
+            || CGEventSource.buttonState(.combinedSessionState, button: .left) {
+            try? await Task.sleep(for: .milliseconds(50))
+        }
+        guard isCurrentPlacement(request) else { return }
+        syncVisibility()
+        await waitForMenuBarLayout()
+        guard isCurrentPlacement(request) else { return }
+        let ready = await MenuBarItemInteraction.moveToLeadingEdge(pid: request.pid, menuBarFrames: menuBarFrames) {
+            self.isCurrentPlacement(request)
+        }
+        if isCurrentPlacement(request) { placements[request.appID] = (request.pid, ready) }
+    }
+
+    private func isCurrentPlacement(_ request: PlacementRequest) -> Bool {
+        !Task.isCancelled && preparingApps[request.appID] == request
+            && runningApps.contains { $0.app.id == request.appID && $0.pid == request.pid }
+    }
+
     private func cancelPlacement() {
         placementGeneration = UUID()
         placementTask?.cancel()
         placementTask = nil
         placementQueue = []
-        preparingAppIDs = []
+        preparingApps = [:]
     }
 
     private func menuBarAnchor() -> CGRect? {
@@ -527,46 +430,18 @@ final class DrawerController: NSObject, NSApplicationDelegate, @preconcurrency N
             syncVisibility()
         }
         if drawerPanel == nil {
-            let panel = DrawerPanel(
-                contentRect: NSRect(x: 0, y: 0, width: 160, height: 46),
-                styleMask: [.borderless, .nonactivatingPanel],
-                backing: .buffered,
-                defer: false
-            )
-            panel.level = .popUpMenu
-            panel.collectionBehavior = [.moveToActiveSpace, .fullScreenAuxiliary]
-            panel.isOpaque = false
-            panel.backgroundColor = .clear
-            panel.hasShadow = true
-            panel.isReleasedWhenClosed = false
-            panel.contentViewController = NSHostingController(rootView: DrawerView(controller: self))
-            panel.onCancel = { [weak self] in self?.dismissDrawer() }
-            drawerPanel = panel
+            drawerPanel = DrawerPanel(content: NSHostingController(rootView: DrawerView(controller: self))) { [weak self] in
+                self?.dismissDrawer()
+            }
         }
-        guard let panel = drawerPanel, let primary = NSScreen.screens.first else { return }
-        panel.dismissesOnResignKey = statusItem?.expandedInterfaceSession == nil
-        let pointer = NSEvent.mouseLocation
-        let screen = NSScreen.screens.first(where: { $0.frame.contains(pointer) }) ?? primary
-        let anchor = menuBarAnchor()
-        let anchorY = anchor.map { primary.frame.maxY - $0.maxY } ?? screen.visibleFrame.maxY
-        let menuIsHere = abs(screen.frame.maxY - pointer.y) < 70
-        let anchorOnScreen = abs(screen.frame.maxY - anchorY) < 70
-            && anchor.map { $0.midX >= screen.frame.minX && $0.midX <= screen.frame.maxX } == true
-        let centerX = anchorOnScreen ? anchor?.midX ?? pointer.x : (menuIsHere ? pointer.x : screen.visibleFrame.maxX - 80)
-        let itemsWidth = CGFloat(drawerApps.count) * 34
-        let contentWidth = drawerApps.isEmpty ? 245 : itemsWidth + 58
-        let width = min(contentWidth, min(480, screen.visibleFrame.width - 16))
-        let height: CGFloat = 46
-        let x = min(max(centerX - width / 2, screen.visibleFrame.minX + 8), screen.visibleFrame.maxX - width - 8)
-        let y = min(screen.visibleFrame.maxY, anchorOnScreen ? anchorY : screen.frame.maxY - NSStatusBar.system.thickness)
-        panel.setFrame(NSRect(x: x, y: y - height - 6, width: width, height: height), display: false)
-        drawerPresentedAt = ProcessInfo.processInfo.systemUptime
-        panel.makeKeyAndOrderFront(nil)
-        monitorDrawerClicks()
+        drawerPanel?.present(
+            anchor: menuBarAnchor(),
+            appCount: drawerApps.count,
+            dismissesOnResignKey: statusItem?.expandedInterfaceSession == nil
+        )
     }
 
     func openHiddenApp(_ app: SavedApp) {
-        NSLog("MenuDrawer: opening menu for %@", app.id)
         updateAccessibility()
         guard let running = NSRunningApplication.runningApplications(withBundleIdentifier: app.id)
             .first(where: { !$0.isTerminated }) else {
@@ -578,11 +453,11 @@ final class DrawerController: NSObject, NSApplicationDelegate, @preconcurrency N
             reportMenuOpenError(String(localized: "accessibility.permissionRequired"))
             return
         }
-        guard preparingAppIDs.isEmpty else { return }
+        guard !isPreparingApps else { return }
         guard let placement = placements[app.id], placement.pid == running.processIdentifier, placement.ready else {
             reportMenuOpenError(String(
                 localized: "error.placeApp",
-                defaultValue: "Couldn’t arrange \(app.name). Move it out of the drawer and add it again."
+                defaultValue: "Couldn’t arrange \(app.name). Check the menu bar or refresh the layout to try again."
             ))
             return
         }
@@ -595,31 +470,22 @@ final class DrawerController: NSObject, NSApplicationDelegate, @preconcurrency N
         let menuBarFrames = self.menuBarFrames
         interactionTask = Task { @MainActor [weak self] in
             guard let self else { return }
-            let originalWindows = await MenuBarInventory.popupFrames(pid: pid)
+            let originalWindows = await MenuBarInventory.windowIDs(pid: pid)
             await waitForMenuBarLayout()
             guard !Task.isCancelled else { return }
-            let opened: Bool
-            let pressed = await MenuBarInventory.press(pid: pid, menuBarFrames: menuBarFrames)
-            let openedByPress = pressed
-                ? await waitForAppMenu(pid: pid, originalWindows: originalWindows, seconds: 0.45)
-                : false
-            if openedByPress {
-                opened = true
-            } else {
-                opened = await clickOriginalItem(pid: pid, menuBarFrames: menuBarFrames, originalWindows: originalWindows)
-            }
+            let menu = await MenuBarItemInteraction.openMenu(
+                pid: pid, menuBarFrames: menuBarFrames, originalWindows: originalWindows
+            )
             guard !Task.isCancelled else { return }
-            guard opened else {
-                NSLog("MenuDrawer: menu did not open for %@", app.id)
+            guard let menu else {
                 reportMenuOpenError(String(localized: "error.openAppMenu", defaultValue: "Couldn’t open the menu for \(app.name)."))
                 return
             }
-            NSLog("MenuDrawer: menu opened for %@", app.id)
 
             while !Task.isCancelled {
                 try? await Task.sleep(for: .milliseconds(300))
                 guard !Task.isCancelled else { return }
-                let menuOpen = await appMenuIsOpen(pid: pid, originalWindows: originalWindows)
+                let menuOpen = await MenuBarItemInteraction.menuIsOpen(pid: pid, menu: menu)
                 guard !Task.isCancelled else { return }
                 if !menuOpen {
                     endInteraction()
@@ -639,58 +505,10 @@ final class DrawerController: NSObject, NSApplicationDelegate, @preconcurrency N
 
     private func waitForMenuBarLayout() async {
         let deadline = ContinuousClock.now.advanced(by: .seconds(4))
-        while isApplying && !Task.isCancelled && ContinuousClock.now < deadline {
+        while visibility.isApplying && !Task.isCancelled && ContinuousClock.now < deadline {
             try? await Task.sleep(for: .milliseconds(50))
         }
         try? await Task.sleep(for: .milliseconds(200))
-    }
-
-    private func clickOriginalItem(pid: pid_t, menuBarFrames: [CGRect], originalWindows: Set<CGRect>) async -> Bool {
-        guard !Task.isCancelled else { return false }
-        let point = await MenuBarInventory.renderedItemCenter(pid: pid, menuBarFrames: menuBarFrames)
-        guard let point, !Task.isCancelled else { return false }
-        if await appMenuIsOpen(pid: pid, originalWindows: originalWindows) { return true }
-        guard await MenuBarClick.send(to: point) else { return false }
-        return await waitForAppMenu(pid: pid, originalWindows: originalWindows, seconds: 1)
-    }
-
-    private func placeAtLeadingEdge(pid: pid_t, menuBarFrames: [CGRect]) async -> Bool {
-        guard let frame = await MenuBarInventory.renderedItemFrame(pid: pid, menuBarFrames: menuBarFrames),
-              let leading = await MenuBarInventory.leadingItemFrame(in: menuBarFrames, containing: frame)
-        else { return false }
-        NSLog("MenuDrawer: placement %@, leading %@", NSStringFromRect(frame), NSStringFromRect(leading))
-        if frame.minX <= leading.minX + 1 { return true }
-        let start = CGPoint(x: frame.midX, y: frame.midY)
-        let end = CGPoint(x: leading.minX + 1, y: frame.midY)
-        guard await MenuBarClick.move(from: start, to: end) else { return false }
-        let deadline = ContinuousClock.now.advanced(by: .seconds(1))
-        while !Task.isCancelled {
-            if let current = await MenuBarInventory.renderedItemFrame(pid: pid, menuBarFrames: menuBarFrames),
-               let first = await MenuBarInventory.leadingItemFrame(in: menuBarFrames, containing: current),
-               current.minX <= first.minX + 1 {
-                NSLog("MenuDrawer: leading placement confirmed %@", NSStringFromRect(current))
-                return true
-            }
-            if ContinuousClock.now >= deadline { return false }
-            try? await Task.sleep(for: .milliseconds(50))
-        }
-        return false
-    }
-
-    private func waitForAppMenu(pid: pid_t, originalWindows: Set<CGRect>, seconds: Double) async -> Bool {
-        let deadline = ContinuousClock.now.advanced(by: .seconds(seconds))
-        while !Task.isCancelled {
-            if await appMenuIsOpen(pid: pid, originalWindows: originalWindows) { return true }
-            if ContinuousClock.now >= deadline { break }
-            try? await Task.sleep(for: .milliseconds(75))
-        }
-        return false
-    }
-
-    private func appMenuIsOpen(pid: pid_t, originalWindows: Set<CGRect>) async -> Bool {
-        let currentWindows = await MenuBarInventory.popupFrames(pid: pid)
-        if !currentWindows.isSubset(of: originalWindows) { return true }
-        return await MenuBarInventory.hasOpenMenu(pid: pid)
     }
 
     private func endInteraction() {
@@ -720,21 +538,5 @@ final class DrawerController: NSObject, NSApplicationDelegate, @preconcurrency N
         refreshMenuBarApps()
         settingsWindow?.makeKeyAndOrderFront(nil)
         NSApp.activate()
-    }
-}
-
-private final class DrawerPanel: NSPanel {
-    var onCancel: (() -> Void)?
-    var dismissesOnResignKey = false
-
-    override var canBecomeKey: Bool { true }
-
-    override func cancelOperation(_ sender: Any?) {
-        onCancel?()
-    }
-
-    override func resignKey() {
-        super.resignKey()
-        if dismissesOnResignKey { onCancel?() }
     }
 }
